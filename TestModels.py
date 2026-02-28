@@ -150,7 +150,6 @@ def pre_emphasis(samples: np.ndarray, coef: float) -> np.ndarray:
     out[1:] = samples[1:] - coef * samples[:-1]
     return out
 
-
 _MAX_GAIN = 10 ** (40.0 / 20.0)   # 40 dB ceiling
 
 def rms_normalize(samples: np.ndarray, target: float) -> np.ndarray:

@@ -245,7 +245,7 @@ def run_epoch(model, loader, criterion, optimizer, device, training: bool):
             if training:
                 optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
                 optimizer.step()
             total_loss += loss.item() * len(labels)
             all_preds.extend(logits.argmax(1).cpu().tolist())

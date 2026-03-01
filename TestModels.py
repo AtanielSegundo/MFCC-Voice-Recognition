@@ -35,9 +35,9 @@ except ImportError:
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from core.cepstral import get_mfcc, Signal, ConfigMFCC
+from core.cepstral import ConfigMFCC
 from core.dsp import pre_emphasis,rms_normalize,extract_features
-from core.models import ConvClassifier
+from core.models import AVAILABLE_MODELS
 
 # ─── Audio / feature constants (overridden from checkpoint) ──────────────────
 
@@ -123,13 +123,17 @@ def run(model_path: str, word_set_path: str | None,
         _cli_preemph: float | None = None,
         _cli_target_rms: float | None = None):
 
-    global FS, DURATION_S, WINDOW_DT, HOP_DT, N_FFT, N_FILTERS, BANK_MIN_F, BANK_MAX_F, WINNER
+    global FS, DURATION_S, WINDOW_DT, HOP_DT, N_FFT, N_FILTERS, BANK_MIN_F, BANK_MAX_F, WINNER, MFCC_CFG
 
     # ── Load checkpoint ──────────────────────────────────────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt   = torch.load(model_path, map_location=device)
-    words  = ckpt["words"]
-    n_mels = ckpt.get("n_mels", N_MELS)
+    words          = ckpt["words"]
+    model          = ckpt["model"]
+    n_frames       = ckpt["n_frames"]
+    average_frames = ckpt["average_frames"]
+    use_deltas     = ckpt["use_deltas"]
+    n_mels         = ckpt.get("n_mels", N_MELS)
 
     FS         = ckpt.get("fs",         FS)
     DURATION_S = ckpt.get("duration",   DURATION_S)
@@ -139,6 +143,7 @@ def run(model_path: str, word_set_path: str | None,
     N_FILTERS  = ckpt.get("n_filters",  N_FILTERS)
     BANK_MIN_F = ckpt.get("bank_min_f", BANK_MIN_F)
     BANK_MAX_F = ckpt.get("bank_max_f", BANK_MAX_F)
+    
 
     if MFCC_CFG is None:
         MFCC_CFG = ConfigMFCC(WINDOW_DT,HOP_DT,N_FFT,N_FILTERS,N_MELS,BANK_MIN_F,BANK_MAX_F)
@@ -153,7 +158,10 @@ def run(model_path: str, word_set_path: str | None,
             words = json.load(f)["words"]
     n_cls = len(words)
 
-    model = ConvClassifier(n_cls, n_mels).to(device)
+    model = AVAILABLE_MODELS[model](n_classes=n_cls,n_frames=n_frames,
+                                    n_mels=n_mels,use_deltas=use_deltas,
+                                    average_frames=average_frames
+                                    ).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
@@ -295,42 +303,40 @@ def run(model_path: str, word_set_path: str | None,
             if len(ring) < speech_samples:
                 continue
 
-            try:
-                samples = np.array(ring, dtype=np.float64)[-speech_samples:]
-                with torch.no_grad():
-                    
-                    if len(samples) < speech_samples:
-                        samples = np.pad(samples, (0, speech_samples - len(samples)))
-                    else:
-                        samples = samples[-speech_samples:]
-
-                    samples = pre_emphasis(samples, preemph_coef)
-                    samples = rms_normalize(samples, target_rms)
-                    feat   = extract_features(samples,FS,DURATION_S,MFCC_CFG).to(device)
-                    logits = model(feat)
-                    probs  = torch.softmax(logits, dim=1).squeeze().cpu().numpy()
-
-                conf = float(np.max(probs))
-                pred = int(np.argmax(probs))
-
-                with lock:
-                    state["probs"]   = probs.copy()
-                    state["n_infer"] += 1
-
-                if conf >= conf_box[0]:
-                    vote_buf.append(pred)
+            
+            samples = np.array(ring, dtype=np.float64)[-speech_samples:]
+            with torch.no_grad():
+                
+                if len(samples) < speech_samples:
+                    samples = np.pad(samples, (0, speech_samples - len(samples)))
                 else:
-                    with lock:
-                        state["n_skip"] += 1
+                    samples = samples[-speech_samples:]
 
-                # Majority vote → update display word
-                if vote_buf:
-                    winner = collections.Counter(vote_buf).most_common(1)[0][0]
-                    with lock:
-                        state["word"] = words[winner]
+                samples = pre_emphasis(samples, preemph_coef)
+                samples = rms_normalize(samples, target_rms)
+                feat   = extract_features(samples,FS,DURATION_S,MFCC_CFG)
+                feat   = torch.from_numpy(feat).unsqueeze(0).to(device)
+                logits = model(feat)
+                probs  = torch.softmax(logits, dim=1).squeeze().cpu().numpy()
 
-            except Exception as ex:
-                print(f"[INFER] {ex}")
+            conf = float(np.max(probs))
+            pred = int(np.argmax(probs))
+
+            with lock:
+                state["probs"]   = probs.copy()
+                state["n_infer"] += 1
+
+            if conf >= conf_box[0]:
+                vote_buf.append(pred)
+            else:
+                with lock:
+                    state["n_skip"] += 1
+
+            # Majority vote → update display word
+            if vote_buf:
+                winner = collections.Counter(vote_buf).most_common(1)[0][0]
+                with lock:
+                    state["word"] = words[winner]
 
     threading.Thread(target=_infer, daemon=True).start()
 

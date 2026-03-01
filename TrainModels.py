@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from core.datasets import stratified_split,HashedSpeechDataset
 from core.plot import (plot_confusion_matrix  ,plot_per_class_metrics,
                        plot_split_distribution,plot_training_curves)
-from core.models import ConvClassifier
+from core.models import AVAILABLE_MODELS
 from core.cepstral import ConfigMFCC
 
 
@@ -37,6 +37,10 @@ EPOCHS      = 500
 LR          = 1e-4
 WEIGHT_DECAY= 1e-4
 SEED        = 42
+
+MODEL          = next(iter(AVAILABLE_MODELS.keys()))
+AVERAGE_FRAMES = False 
+USE_DELTAS     = True
 
 def run_epoch(model, loader, criterion, optimizer, device, training: bool):
     model.train(training)
@@ -118,7 +122,8 @@ def main(dataset_path: str, word_set_path=None):
 
     print("\n[TRAIN] Building dataset ...")
     mfcc_cfg = ConfigMFCC(WINDOW_DT,HOP_DT,N_FFT,N_FILTERS,N_MELS,BANK_MIN_F,BANK_MAX_F)
-    full_ds =HashedSpeechDataset(dataset_path, word_set_path=word_set_path, cache=True)
+    full_ds =HashedSpeechDataset(dataset_path, word_set_path=word_set_path, cache=True,
+                                 mfcc_cfg=mfcc_cfg)
 
     train_idx, val_idx = stratified_split(
         full_ds.samples, full_ds.n_classes, TRAIN_SPLIT, SEED)
@@ -143,7 +148,15 @@ def main(dataset_path: str, word_set_path=None):
     val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE,
                               shuffle=False, num_workers=0, pin_memory=False)
 
-    model    = ConvClassifier(n_classes=full_ds.n_classes, n_mels=N_MELS).to(device)
+    sample_features, _ = full_ds[0]
+    n_frames = sample_features.shape[1]
+    model_cls = AVAILABLE_MODELS.get(MODEL,None)
+    if not model_cls:
+        print(f"[ERROR] {MODEL} Is Not An Valid Model") 
+    model    = AVAILABLE_MODELS[MODEL](n_classes=full_ds.n_classes,n_frames=n_frames,
+                                       n_mels=N_MELS,average_frames=AVERAGE_FRAMES,
+                                       use_deltas=USE_DELTAS
+                                       ).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"\n[MODEL] Parameters: {n_params:,}")
     print(model)
@@ -194,6 +207,10 @@ def main(dataset_path: str, word_set_path=None):
                 "n_filters":   N_FILTERS,
                 "bank_min_f":  BANK_MIN_F,
                 "bank_max_f":  BANK_MAX_F,
+                "model"     :  MODEL,
+                "n_frames"  : n_frames,
+                "average_frames": AVERAGE_FRAMES,
+                "use_deltas": USE_DELTAS
             }, best_model_path)
             tag = "  <- best"
         else:
@@ -225,6 +242,10 @@ def main(dataset_path: str, word_set_path=None):
         "n_filters":   N_FILTERS,
         "bank_min_f":  BANK_MIN_F,
         "bank_max_f":  BANK_MAX_F,
+        "model":       MODEL,
+        "n_frames":    n_frames,
+        "average_frames": AVERAGE_FRAMES,
+        "use_deltas": USE_DELTAS
     }, final_model_path)
     print(f"[SAVE] Final model : {final_model_path}")
     print(f"[SAVE] Best model  : {best_model_path}")
@@ -243,7 +264,7 @@ def main(dataset_path: str, word_set_path=None):
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser("Numbers Classifier Trainer")
+    parser = argparse.ArgumentParser("Word Classifier Trainer")
     parser.add_argument("--dataset",    "-ds",  default="./numbers")
     parser.add_argument("--word_set",   "-ws",  default=None)
     parser.add_argument("--epochs",     "-e",   type=int,   default=EPOCHS)
@@ -256,6 +277,11 @@ if __name__ == "__main__":
     parser.add_argument("--n_mels",             type=int,   default=N_MELS)
     parser.add_argument("--bank_min_f", "-bmin",type=float, default=BANK_MIN_F)
     parser.add_argument("--bank_max_f", "-bmax",type=float, default=BANK_MAX_F)
+    parser.add_argument("--model","-m",type=str,default=MODEL,
+                        help=f"Available Models: {', '.join(list(AVAILABLE_MODELS.keys()))}"
+                        )
+    parser.add_argument("--average_frames", "-avg", default=AVERAGE_FRAMES, action="store_true")
+    parser.add_argument("--no_deltas", "-deltas", default=USE_DELTAS, action="store_false")
     args = parser.parse_args()
 
     EPOCHS     = args.epochs
@@ -268,5 +294,8 @@ if __name__ == "__main__":
     N_MELS     = args.n_mels
     BANK_MIN_F = args.bank_min_f
     BANK_MAX_F = args.bank_max_f
+    MODEL      = args.model
+    AVERAGE_FRAMES = args.average_frames
+    USE_DELTAS = args.no_deltas
 
     main(dataset_path=args.dataset, word_set_path=args.word_set)

@@ -670,7 +670,6 @@ def cut_and_window(
 
 # ─── Step 5  (--clean) ────────────────────────────────────────────────────────
 
-# Extensions and filename patterns that are considered intermediate artefacts
 _INTERMEDIATE_EXTENSIONS = {
     ".txt",          # transcript copies
     ".textgrid",     # MFA alignment grids

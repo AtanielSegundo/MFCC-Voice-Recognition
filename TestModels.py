@@ -34,12 +34,17 @@ except ImportError:
     print("[WARN] sounddevice not found — running in DEMO mode.")
 
 sys.path.insert(0, os.path.dirname(__file__))
-from MFCC.cepstral import get_mfcc, Signal
+
+from core.cepstral import get_mfcc, Signal, ConfigMFCC
+from core.dsp import pre_emphasis,rms_normalize,extract_features
+from core.models import ConvClassifier
 
 # ─── Audio / feature constants (overridden from checkpoint) ──────────────────
 
 FS          = 16_000
 DURATION_S  = 0.75
+
+
 WINDOW_DT   = 25e-3
 HOP_DT      = 10e-3
 N_FFT       = 1024
@@ -47,6 +52,8 @@ N_FILTERS   = 20
 N_MELS      = 16
 BANK_MIN_F  = 0.0
 BANK_MAX_F  = 4600.0
+
+MFCC_CFG    = None 
 
 CHUNK_S          = 0.03
 VAD_HOLD_S       = 0.35
@@ -78,92 +85,8 @@ C_WARN      = (255,  88,  72)
 
 WIN_W, WIN_H = 1280, 720
 
-
-# ─── Model ───────────────────────────────────────────────────────────────────
-
-class MFCCClassifier(nn.Module):
-    def __init__(self, n_classes, n_mels=N_MELS):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(3, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(True),
-            nn.Conv2d(32, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(True),
-            nn.MaxPool2d(2), nn.Dropout2d(0.25),
-            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(True),
-            nn.Conv2d(64, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(True),
-            nn.MaxPool2d(2), nn.Dropout2d(0.25),
-            nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(True),
-            nn.MaxPool2d(2), nn.Dropout2d(0.25),
-        )
-        self.pool = nn.AdaptiveAvgPool2d((4, 4))
-        self.head = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(128 * 4 * 4, 256), nn.ReLU(True), nn.Dropout(0.5),
-            nn.Linear(256, n_classes),
-        )
-
-    def forward(self, x):
-        return self.head(self.pool(self.conv(x)))
-
-
-# ─── Feature extraction ──────────────────────────────────────────────────────
-
-def _delta(m, width=2):
-    pad = np.pad(m, ((width, width), (0, 0)), mode="edge")
-    d   = 2.0 * sum(t * t for t in range(1, width + 1))
-    return np.array([
-        sum(w * (pad[t+width+w] - pad[t+width-w]) for w in range(1, width+1)) / d
-        for t in range(m.shape[0])
-    ])
-
-def extract_features(samples, speech_samples, preemph_coef=0.0, target_rms=0.0):
-    # Pad / crop to exact window length
-    if len(samples) < speech_samples:
-        samples = np.pad(samples, (0, speech_samples - len(samples)))
-    else:
-        samples = samples[-speech_samples:]
-
-    # Match the MakeDataset processing chain (pre_emphasis → rms_normalize → MFCC)
-    # NOTE: Tukey window is intentionally omitted — it was used in dataset creation
-    # to smooth cut edges; applying it on a live sliding window would attenuate real
-    # speech at the boundaries, hurting inference.
-    samples = pre_emphasis(samples, preemph_coef)
-    samples = rms_normalize(samples, target_rms)
-
-    sig  = Signal(samples, FS, DURATION_S)
-    mfcc = get_mfcc(sig, WINDOW_DT, HOP_DT, N_FFT, N_FILTERS, N_MELS,
-                    BANK_MIN_F, BANK_MAX_F)
-    d1   = _delta(mfcc)
-    d2   = _delta(d1)
-    feat = np.stack([mfcc, d1, d2], axis=0).astype(np.float32)
-    return torch.from_numpy(feat).unsqueeze(0)
-
 def rms(chunk):
     return float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2)))
-
-
-def pre_emphasis(samples: np.ndarray, coef: float) -> np.ndarray:
-    """y[n] = x[n] - coef * x[n-1]  — first-order high-pass."""
-    if coef == 0.0:
-        return samples
-    out    = np.empty_like(samples)
-    out[0] = samples[0]
-    out[1:] = samples[1:] - coef * samples[:-1]
-    return out
-
-_MAX_GAIN = 10 ** (40.0 / 20.0)   # 40 dB ceiling
-
-def rms_normalize(samples: np.ndarray, target: float) -> np.ndarray:
-    """Scale samples to *target* RMS. No-op when target <= 0 or signal is silent."""
-    if target <= 0.0:
-        return samples
-    r = float(np.sqrt(np.mean(samples ** 2)))
-    if r < 1e-9:
-        return samples
-    scale = min(target / r, _MAX_GAIN)
-    return np.clip(samples * scale, -1.0, 1.0)
-
-
-# ─── Demo audio ──────────────────────────────────────────────────────────────
 
 def _demo_thread(q, stop, chunk_samples):
     rng = np.random.default_rng(1)
@@ -217,6 +140,9 @@ def run(model_path: str, word_set_path: str | None,
     BANK_MIN_F = ckpt.get("bank_min_f", BANK_MIN_F)
     BANK_MAX_F = ckpt.get("bank_max_f", BANK_MAX_F)
 
+    if MFCC_CFG is None:
+        MFCC_CFG = ConfigMFCC(WINDOW_DT,HOP_DT,N_FFT,N_FILTERS,N_MELS,BANK_MIN_F,BANK_MAX_F)
+
     chunk_samples   = int(FS * CHUNK_S)
     ring_capacity   = int(FS * 2.0)
     speech_samples  = int(FS * DURATION_S)
@@ -227,7 +153,7 @@ def run(model_path: str, word_set_path: str | None,
             words = json.load(f)["words"]
     n_cls = len(words)
 
-    model = MFCCClassifier(n_cls, n_mels).to(device)
+    model = ConvClassifier(n_cls, n_mels).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
@@ -314,7 +240,7 @@ def run(model_path: str, word_set_path: str | None,
 
     # ── Inference thread ──────────────────────────────────────────────────────
     def _infer():
-        global WINNER
+        global WINNER,MFCC_CFG
         vad_hold  = 0
         chunk_ctr = 0
         # Rolling window of recent confident class predictions
@@ -372,8 +298,15 @@ def run(model_path: str, word_set_path: str | None,
             try:
                 samples = np.array(ring, dtype=np.float64)[-speech_samples:]
                 with torch.no_grad():
-                    feat   = extract_features(samples, speech_samples,
-                                              preemph_coef, target_rms).to(device)
+                    
+                    if len(samples) < speech_samples:
+                        samples = np.pad(samples, (0, speech_samples - len(samples)))
+                    else:
+                        samples = samples[-speech_samples:]
+
+                    samples = pre_emphasis(samples, preemph_coef)
+                    samples = rms_normalize(samples, target_rms)
+                    feat   = extract_features(samples,FS,DURATION_S,MFCC_CFG).to(device)
                     logits = model(feat)
                     probs  = torch.softmax(logits, dim=1).squeeze().cpu().numpy()
 

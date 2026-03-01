@@ -1,29 +1,31 @@
 """
 TestModels.py
 ─────────────
-Real-time Portuguese number word recognition from microphone.
+Real-time word recognition from microphone or system loopback.
 
 How it works:
   - Ring buffer holds the last ~2 s of audio
-  - When RMS energy crosses the VAD threshold → run the model every INFER_EVERY chunks
-  - If max(softmax) >= conf_threshold → add prediction to a small vote window
-  - Display the majority winner of the vote window (or "—" if no speech)
+  - VAD = pure RMS energy threshold (reliable, same as original)
+  - When VAD crosses threshold → run the model every INFER_EVERY chunks
+  - Inference runs on the highest-energy window inside the ring buffer
+  - Entropy gate rejects predictions where the model is genuinely confused
+  - Softmax is temperature-scaled for better confidence calibration
+  - If max(softmax) >= conf_threshold → add (pred, conf) to weighted vote window
+  - Display the confidence-weighted majority winner (or "—" if no speech)
   - On silence → drain the vote window one slot at a time so the display fades to "—"
-
-No state machine. No settling period. No event pooling.
 
 Controls:
     Q / ESC   — quit
     SPACE     — mute / unmute
-    +  /  -   — raise / lower VAD energy threshold   (step 0.001)
-    C  /  V   — raise / lower confidence threshold   (step 0.05)
+    +  /  -   — raise / lower VAD energy threshold (step 0.001)
+    C  /  V   — raise / lower confidence threshold (step 0.05)
+    T  /  G   — raise / lower softmax temperature  (step 0.1)
     H         — toggle probability bars
 """
 
 import os, sys, json, argparse, queue, threading, time, collections
 import numpy as np
 import torch
-import torch.nn as nn
 import pygame
 
 try:
@@ -36,14 +38,13 @@ except ImportError:
 sys.path.insert(0, os.path.dirname(__file__))
 
 from core.cepstral import ConfigMFCC
-from core.dsp import pre_emphasis,rms_normalize,extract_features
+from core.dsp import pre_emphasis, rms_normalize, extract_features
 from core.models import AVAILABLE_MODELS
 
 # ─── Audio / feature constants (overridden from checkpoint) ──────────────────
 
 FS          = 16_000
 DURATION_S  = 0.75
-
 
 WINDOW_DT   = 25e-3
 HOP_DT      = 10e-3
@@ -53,17 +54,17 @@ N_MELS      = 16
 BANK_MIN_F  = 0.0
 BANK_MAX_F  = 4600.0
 
-MFCC_CFG    = None 
+MFCC_CFG    = None
 
 CHUNK_S          = 0.03
 VAD_HOLD_S       = 0.35
 INFER_EVERY      = 3
 
-# Rolling window of recent confident predictions for majority vote.
-# Higher = more stable but slower to update.
 VOTE_WINDOW      = 4
 
-CONF_DEFAULT     = 0.55     # min max-prob to count a prediction
+CONF_DEFAULT     = 0.55
+TEMPERATURE_DEF  = 1.5     # softmax temperature; >1 spreads probs, 1 = raw
+ENTROPY_GATE     = 0.55    # reject if entropy/max_entropy exceeds this fraction
 
 WINNER = "-"
 
@@ -85,8 +86,12 @@ C_WARN      = (255,  88,  72)
 
 WIN_W, WIN_H = 1280, 720
 
-def rms(chunk):
+
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+def rms(chunk: np.ndarray) -> float:
     return float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2)))
+
 
 def _demo_thread(q, stop, chunk_samples):
     rng = np.random.default_rng(1)
@@ -101,8 +106,6 @@ def _demo_thread(q, stop, chunk_samples):
             time.sleep(CHUNK_S)
 
 
-# ─── Pygame helpers ───────────────────────────────────────────────────────────
-
 def _rr(surf, rect, r, col):
     pygame.draw.rect(surf, col, rect, border_radius=r)
 
@@ -116,20 +119,68 @@ def _lerp(a, b, t):
     return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
 
 
+# ─── Device resolution ────────────────────────────────────────────────────────
+
+def _resolve_device(use_loopback: bool, explicit: str | None):
+    """
+    Returns a sounddevice device index/name, or None for the system default mic.
+    Priority: explicit --device > --loopback auto-detect > default mic
+    """
+    if explicit is not None:
+        try:    return int(explicit)
+        except: return explicit
+
+    if not use_loopback:
+        return None
+
+    import platform
+    sys_name = platform.system()
+
+    if sys_name == "Linux":
+        devs = sd.query_devices()
+        for i, d in enumerate(devs):
+            if "monitor" in d["name"].lower() and d["max_input_channels"] > 0:
+                print(f"[LOOPBACK] Using: {d['name']}")
+                return i
+        print("[WARN] No monitor source found — available devices:")
+        print(sd.query_devices())
+        print("[TIP]  Run  pactl list sources short  and pass the name with --device")
+        return None
+
+    elif sys_name == "Windows":
+        devs = sd.query_devices()
+        for i, d in enumerate(devs):
+            if "loopback" in d["name"].lower() and d["max_input_channels"] > 0:
+                print(f"[LOOPBACK] Using: {d['name']}")
+                return i
+        print("[WARN] No WASAPI loopback device found.")
+        print("[TIP]  Enable 'Stereo Mix' in Windows Sound settings or use --device.")
+        return None
+
+    print(f"[WARN] Loopback auto-detect not implemented for {sys_name}. Use --device.")
+    return None
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
-def run(model_path: str, word_set_path: str | None,
+def run(model_path: str,
+        word_set_path: str | None,
+        use_loopback: bool = False,
+        audio_device: str | None = None,
         conf_threshold: float = CONF_DEFAULT,
+        temperature: float = TEMPERATURE_DEF,
         _cli_preemph: float | None = None,
         _cli_target_rms: float | None = None):
 
-    global FS, DURATION_S, WINDOW_DT, HOP_DT, N_FFT, N_FILTERS, BANK_MIN_F, BANK_MAX_F, WINNER, MFCC_CFG
+    global FS, DURATION_S, WINDOW_DT, HOP_DT, N_FFT, N_FILTERS, \
+           BANK_MIN_F, BANK_MAX_F, WINNER, MFCC_CFG
 
     # ── Load checkpoint ──────────────────────────────────────────────────────
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt   = torch.load(model_path, map_location=device)
+    torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ckpt         = torch.load(model_path, map_location=torch_device)
+
     words          = ckpt["words"]
-    model          = ckpt["model"]
+    model_name     = ckpt["model"]
     n_frames       = ckpt["n_frames"]
     average_frames = ckpt["average_frames"]
     use_deltas     = ckpt["use_deltas"]
@@ -143,10 +194,10 @@ def run(model_path: str, word_set_path: str | None,
     N_FILTERS  = ckpt.get("n_filters",  N_FILTERS)
     BANK_MIN_F = ckpt.get("bank_min_f", BANK_MIN_F)
     BANK_MAX_F = ckpt.get("bank_max_f", BANK_MAX_F)
-    
 
     if MFCC_CFG is None:
-        MFCC_CFG = ConfigMFCC(WINDOW_DT,HOP_DT,N_FFT,N_FILTERS,N_MELS,BANK_MIN_F,BANK_MAX_F)
+        MFCC_CFG = ConfigMFCC(WINDOW_DT, HOP_DT, N_FFT, N_FILTERS,
+                               n_mels, BANK_MIN_F, BANK_MAX_F)
 
     chunk_samples   = int(FS * CHUNK_S)
     ring_capacity   = int(FS * 2.0)
@@ -158,58 +209,49 @@ def run(model_path: str, word_set_path: str | None,
             words = json.load(f)["words"]
     n_cls = len(words)
 
-    model = AVAILABLE_MODELS[model](n_classes=n_cls,n_frames=n_frames,
-                                    n_mels=n_mels,use_deltas=use_deltas,
-                                    average_frames=average_frames
-                                    ).to(device)
+    # ── Build model ──────────────────────────────────────────────────────────
+    model = AVAILABLE_MODELS[model_name](
+        n_classes=n_cls, n_frames=n_frames,
+        n_mels=n_mels, use_deltas=use_deltas,
+        average_frames=average_frames
+    ).to(torch_device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
-    # ── Pre-processing params — must match what MakeDataset used ─────────────
-    # Priority: CLI arg > checkpoint > metadata.json auto-discovery > default
+    # ── Pre-processing params ────────────────────────────────────────────────
     _DEFAULT_PREEMPH    = 0.97
-    _DEFAULT_TARGET_RMS = 0.0     # 0 = disabled (safe default when unknown)
+    _DEFAULT_TARGET_RMS = 0.0
 
-    def _load_metadata_json(model_path: str) -> dict:
-        """Try to find metadata.json in the dataset folder next to the training dir."""
-        # model_path is typically <dataset>_training/model_best.pt
-        # dataset folder is one level up, named <dataset>
-        training_dir = os.path.dirname(os.path.abspath(model_path))
+    def _load_metadata_json(mp: str) -> dict:
+        training_dir = os.path.dirname(os.path.abspath(mp))
         parent       = os.path.dirname(training_dir)
-        # strip trailing "_training" from the folder name
         folder_name  = os.path.basename(training_dir)
         dataset_name = folder_name[:-9] if folder_name.endswith("_training") else folder_name
-        candidates   = [
-            os.path.join(parent, dataset_name, "metadata.json"),
-            os.path.join(parent, "metadata.json"),
-            os.path.join(training_dir, "metadata.json"),
-        ]
-        for p in candidates:
+        for p in [os.path.join(parent, dataset_name, "metadata.json"),
+                  os.path.join(parent, "metadata.json"),
+                  os.path.join(training_dir, "metadata.json")]:
             if os.path.isfile(p):
                 with open(p) as f:
                     return json.load(f)
         return {}
 
-    meta = _load_metadata_json(model_path)
+    meta         = _load_metadata_json(model_path)
+    preemph_coef = ckpt.get("preemph",    meta.get("preemph",    _DEFAULT_PREEMPH))
+    target_rms   = ckpt.get("target_rms", meta.get("target_rms", _DEFAULT_TARGET_RMS))
+    if _cli_preemph    is not None: preemph_coef = _cli_preemph
+    if _cli_target_rms is not None: target_rms   = _cli_target_rms
 
-    # Read from checkpoint, then metadata.json, then default
-    preemph_coef = ckpt.get("preemph",
-                   meta.get("preemph", _DEFAULT_PREEMPH))
-    target_rms   = ckpt.get("target_rms",
-                   meta.get("target_rms", _DEFAULT_TARGET_RMS))
-
-    # CLI can override
-    if _cli_preemph is not None:
-        preemph_coef = _cli_preemph
-    if _cli_target_rms is not None:
-        target_rms   = _cli_target_rms
-
-    print(f"[MODEL] {n_cls} classes: {words}")
-    print(f"[PREPROC] pre_emphasis coef : {preemph_coef}"
+    print(f"[MODEL]   {n_cls} classes : {words}")
+    print(f"[MODEL]   Architecture   : {model_name}")
+    print(f"[PREPROC] pre_emphasis   : {preemph_coef}"
           f"  ({'enabled' if preemph_coef > 0 else 'DISABLED'})")
-    print(f"[PREPROC] RMS target        : {target_rms:.4f}"
-          f"  ({20*np.log10(target_rms):.1f} dBFS)" if target_rms > 0
-          else "[PREPROC] RMS normalisation : DISABLED")
+    if target_rms > 0:
+        print(f"[PREPROC] RMS target     : {target_rms:.4f}"
+              f"  ({20*np.log10(target_rms):.1f} dBFS)")
+    else:
+        print("[PREPROC] RMS normalisation : DISABLED")
+    print(f"[INFER]   temperature    : {temperature}")
+    print(f"[INFER]   entropy gate   : {ENTROPY_GATE:.0%} of max entropy")
 
     # ── Shared state ─────────────────────────────────────────────────────────
     lock  = threading.Lock()
@@ -222,13 +264,13 @@ def run(model_path: str, word_set_path: str | None,
         "n_skip":   0,
     }
 
-    # Mutable settings (list wrappers so inference thread sees changes)
     vad_thr   = [0.002]
     conf_box  = [conf_threshold]
+    temp_box  = [temperature]
     muted     = [False]
     show_bars = [True]
 
-    # ── Audio ─────────────────────────────────────────────────────────────────
+    # ── Audio stream ─────────────────────────────────────────────────────────
     audio_q  = queue.Queue(maxsize=400)
     stop_evt = threading.Event()
     ring     = collections.deque(maxlen=ring_capacity)
@@ -237,22 +279,30 @@ def run(model_path: str, word_set_path: str | None,
         def _cb(indata, frames, t, status):
             try: audio_q.put_nowait(indata[:, 0].astype(np.float32))
             except queue.Full: pass
-        stream = sd.InputStream(samplerate=FS, channels=1, dtype="float32",
-                                blocksize=chunk_samples, callback=_cb)
+
+        resolved_device = _resolve_device(use_loopback, audio_device)
+        stream = sd.InputStream(
+            samplerate=FS, channels=1, dtype="float32",
+            blocksize=chunk_samples, callback=_cb,
+            device=resolved_device
+        )
         stream.start()
-        print("[MIC] stream started.")
+        src_label = "LOOPBACK" if use_loopback else "MIC"
+        dev_info  = str(resolved_device) if resolved_device is not None else "default"
+        print(f"[{src_label}] device={dev_info}  stream started.")
     else:
-        threading.Thread(target=_demo_thread,
-                         args=(audio_q, stop_evt, chunk_samples), daemon=True).start()
-        print("[MIC] demo mode.")
+        threading.Thread(
+            target=_demo_thread,
+            args=(audio_q, stop_evt, chunk_samples), daemon=True
+        ).start()
+        print("[AUDIO] demo mode (sounddevice unavailable).")
 
     # ── Inference thread ──────────────────────────────────────────────────────
     def _infer():
-        global WINNER,MFCC_CFG
+        global WINNER, MFCC_CFG
         vad_hold  = 0
         chunk_ctr = 0
-        # Rolling window of recent confident class predictions
-        vote_buf  = collections.deque(maxlen=VOTE_WINDOW)
+        vote_buf  = collections.deque(maxlen=VOTE_WINDOW)  # stores (class, conf)
 
         while not stop_evt.is_set():
             try:
@@ -261,8 +311,9 @@ def run(model_path: str, word_set_path: str | None,
                 continue
 
             ring.extend(chunk)
-            e = rms(chunk)
 
+            # ── VAD: pure RMS energy ─────────────────────────────────────────
+            e = rms(chunk)
             with lock:
                 state["energy"] = e
 
@@ -274,7 +325,6 @@ def run(model_path: str, word_set_path: str | None,
                     state["word"]     = "—"
                 continue
 
-            # VAD
             if e >= vad_thr[0]:
                 vad_hold = vad_hold_chunks
             elif vad_hold > 0:
@@ -285,7 +335,7 @@ def run(model_path: str, word_set_path: str | None,
                 state["speaking"] = speaking
 
             if not speaking:
-                # Gradually drain vote buffer → display fades to "—"
+                # Gradually drain vote buffer so display fades to "—"
                 if vote_buf:
                     vote_buf.popleft()
                 if not vote_buf:
@@ -303,38 +353,59 @@ def run(model_path: str, word_set_path: str | None,
             if len(ring) < speech_samples:
                 continue
 
-            
-            samples = np.array(ring, dtype=np.float64)[-speech_samples:]
+            # ── Pick the highest-energy window from the ring buffer ──────────
+            # Handles early/late speech onset better than always taking the tail
+            arr    = np.array(ring, dtype=np.float64)
+            step   = chunk_samples
+            starts = range(0, max(1, len(arr) - speech_samples + 1), step)
+            best_start = max(
+                starts,
+                key=lambda s: float(np.mean(arr[s:s + speech_samples] ** 2))
+            )
+            samples = arr[best_start: best_start + speech_samples]
+
             with torch.no_grad():
-                
                 if len(samples) < speech_samples:
                     samples = np.pad(samples, (0, speech_samples - len(samples)))
-                else:
-                    samples = samples[-speech_samples:]
 
                 samples = pre_emphasis(samples, preemph_coef)
                 samples = rms_normalize(samples, target_rms)
-                feat   = extract_features(samples,FS,DURATION_S,MFCC_CFG)
-                feat   = torch.from_numpy(feat).unsqueeze(0).to(device)
-                logits = model(feat)
-                probs  = torch.softmax(logits, dim=1).squeeze().cpu().numpy()
+                feat    = extract_features(samples, FS, DURATION_S, MFCC_CFG)
+                feat    = torch.from_numpy(feat).unsqueeze(0).to(torch_device)
+                logits  = model(feat)
+
+                # ── Temperature scaling ──────────────────────────────────────
+                T     = max(temp_box[0], 0.1)
+                probs = torch.softmax(logits / T, dim=1).squeeze().cpu().numpy()
+
+            # ── Entropy gate: skip flat/confused distributions ───────────────
+            entropy     = -float(np.sum(probs * np.log(probs + 1e-9)))
+            max_entropy = np.log(n_cls)
+            if entropy / max_entropy > ENTROPY_GATE:
+                with lock:
+                    state["n_skip"] += 1
+                    state["probs"]   = probs.copy()
+                continue
 
             conf = float(np.max(probs))
             pred = int(np.argmax(probs))
 
             with lock:
-                state["probs"]   = probs.copy()
+                state["probs"]    = probs.copy()
                 state["n_infer"] += 1
 
             if conf >= conf_box[0]:
-                vote_buf.append(pred)
+                vote_buf.append((pred, conf))
             else:
                 with lock:
                     state["n_skip"] += 1
 
-            # Majority vote → update display word
+            # ── Confidence-weighted majority vote ────────────────────────────
             if vote_buf:
-                winner = collections.Counter(vote_buf).most_common(1)[0][0]
+                scores = collections.defaultdict(float)
+                for cls_idx, cls_conf in vote_buf:
+                    scores[cls_idx] += cls_conf
+                winner = max(scores, key=scores.get)
                 with lock:
                     state["word"] = words[winner]
 
@@ -382,10 +453,13 @@ def run(model_path: str, word_set_path: str | None,
                     conf_box[0] = min(conf_box[0] + 0.05, 0.99)
                 elif k == pygame.K_v:
                     conf_box[0] = max(conf_box[0] - 0.05, 0.10)
+                elif k == pygame.K_t:
+                    temp_box[0] = round(min(temp_box[0] + 0.1, 5.0), 2)
+                elif k == pygame.K_g:
+                    temp_box[0] = round(max(temp_box[0] - 0.1, 0.2), 2)
                 elif k == pygame.K_h:
                     show_bars[0] = not show_bars[0]
 
-        # Snapshot
         with lock:
             cur_word = state["word"]
             probs    = state["probs"].copy()
@@ -396,11 +470,8 @@ def run(model_path: str, word_set_path: str | None,
 
         energy_smooth = energy_smooth * 0.72 + energy * 0.28
         breathe_t    += dt * 0.85
+        disp_probs    = disp_probs * 0.80 + probs * 0.20
 
-        # Smooth bars toward latest softmax output
-        disp_probs = disp_probs * 0.80 + probs * 0.20
-
-        # Word pop
         if cur_word != prev_word:
             word_scale = 1.40
             prev_word  = cur_word
@@ -409,114 +480,133 @@ def run(model_path: str, word_set_path: str | None,
         # ── Draw ─────────────────────────────────────────────────────────────
         screen.fill(C_BG)
 
-        # Header
         pygame.draw.rect(screen, C_PANEL, (0, 0, WIN_W, 48))
         pygame.draw.line(screen, C_BORDER, (0, 48), (WIN_W, 48), 1)
         _t(screen, "TestModels  ·  Real-Time Word Recognition",
-           font_sm, C_DIM, WIN_W//2, 13, anchor="midtop")
+           font_sm, C_DIM, WIN_W // 2, 13, anchor="midtop")
 
+        src_tag = "LOOP" if use_loopback else "MIC"
         if muted[0]:
-            s_col, s_lbl = C_WARN, "MUTED"
+            s_col, s_lbl = C_WARN, f"MUTED [{src_tag}]"
         elif speaking:
-            s_col, s_lbl = C_SPEAKING, "● SPEAKING"
+            s_col, s_lbl = C_SPEAKING, f"● SPEAKING [{src_tag}]"
         else:
-            s_col, s_lbl = C_SILENT, "○ LISTENING"
+            s_col, s_lbl = C_SILENT, f"○ LISTENING [{src_tag}]"
 
-        _t(screen, s_lbl, font_sm, s_col, WIN_W-14, 16, anchor="topright")
-        _t(screen, f"infer:{n_infer}  skipped:{n_skip}  conf≥{conf_box[0]:.2f}  vote:{VOTE_WINDOW}",
+        _t(screen, s_lbl, font_sm, s_col, WIN_W - 14, 16, anchor="topright")
+        _t(screen,
+           f"infer:{n_infer}  skip:{n_skip}  conf≥{conf_box[0]:.2f}"
+           f"  T={temp_box[0]:.1f}  vote:{VOTE_WINDOW}",
            font_mono, C_DIM, 14, 16, anchor="topleft")
 
-        # Big word
         WORD_CY = 165
         ws = font_xl.render(cur_word.upper(), True, C_WORD_ON)
         if word_scale > 1.001:
             ws = pygame.transform.smoothscale(
-                ws, (int(ws.get_width()*word_scale), int(ws.get_height()*word_scale)))
-        screen.blit(ws, ws.get_rect(center=(WIN_W//2, WORD_CY)))
+                ws, (int(ws.get_width() * word_scale),
+                     int(ws.get_height() * word_scale)))
+        screen.blit(ws, ws.get_rect(center=(WIN_W // 2, WORD_CY)))
 
-        # Ring glow
         RING_R = 82
-        CX, CY = WIN_W//2, WORD_CY - 46
+        CX, CY = WIN_W // 2, WORD_CY - 46
         ov = pygame.Surface((WIN_W, 380), pygame.SRCALPHA)
         if speaking and not muted[0]:
             p = 0.5 + 0.5 * np.sin(time.perf_counter() * 5.2)
-            pygame.draw.circle(ov, (*C_SPEAKING, int(50 + 95*p)),
-                               (CX, CY), int(RING_R + 13*p), 3)
+            pygame.draw.circle(ov, (*C_SPEAKING, int(50 + 95 * p)),
+                               (CX, CY), int(RING_R + 13 * p), 3)
         else:
             b = 0.22 + 0.16 * np.sin(breathe_t)
-            pygame.draw.circle(ov, (*C_SILENT, int(40*b)), (CX, CY), RING_R, 2)
+            pygame.draw.circle(ov, (*C_SILENT, int(40 * b)), (CX, CY), RING_R, 2)
         screen.blit(ov, (0, 48))
 
-        # Energy bar
-        BX, BY, BW, BH = 52, 278, WIN_W-104, 11
+        BX, BY, BW, BH = 52, 278, WIN_W - 104, 11
         _rr(screen, (BX, BY, BW, BH), 5, C_BAR_BG)
-        fw = int(min(energy_smooth/0.05, 1.0)*BW)
+        fw = int(min(energy_smooth / 0.05, 1.0) * BW)
         if fw > 2:
             _rr(screen, (BX, BY, fw, BH), 5, C_SPEAKING if speaking else C_ACCENT)
-        tx = BX + int(min(vad_thr[0]/0.05, 1.0)*BW)
-        pygame.draw.line(screen, C_WARN, (tx, BY-4), (tx, BY+BH+4), 2)
-        _t(screen, "energy", font_sm, C_DIM, BX, BY+BH+5, anchor="topleft")
+        tx = BX + int(min(vad_thr[0] / 0.05, 1.0) * BW)
+        pygame.draw.line(screen, C_WARN, (tx, BY - 4), (tx, BY + BH + 4), 2)
+        _t(screen, "energy (RMS)", font_sm, C_DIM, BX, BY + BH + 5, anchor="topleft")
         _t(screen, f"VAD {vad_thr[0]:.4f}  (+/- adjust)",
-           font_sm, C_DIM, BX+BW, BY+BH+5, anchor="topright")
+           font_sm, C_DIM, BX + BW, BY + BH + 5, anchor="topright")
 
-        # Probability bars
         if show_bars[0]:
             BAR_TOP = 310
             BAR_BOT = WIN_H - 72
             MAX_H   = BAR_BOT - BAR_TOP - 38
-            cw = (WIN_W-80)/n_cls
-            cp = max(4, int(cw*0.13))
+            cw = (WIN_W - 80) / n_cls
+            cp = max(4, int(cw * 0.13))
             best = int(np.argmax(disp_probs)) if disp_probs.sum() > 0 else -1
 
             for i, (word, prob) in enumerate(zip(words, disp_probs)):
-                cx = 40 + (i+0.5)*cw
-                bx = int(40 + i*cw + cp)
-                bw = max(1, int(cw - 2*cp))
+                cx = 40 + (i + 0.5) * cw
+                bx = int(40 + i * cw + cp)
+                bw = max(1, int(cw - 2 * cp))
                 bh = max(1, int(prob * MAX_H))
                 by = BAR_TOP + MAX_H - bh + 2
 
-                _rr(screen, (bx, BAR_TOP+2, bw, MAX_H), 4, C_BAR_BG)
+                _rr(screen, (bx, BAR_TOP + 2, bw, MAX_H), 4, C_BAR_BG)
                 is_best = (i == best)
-                if is_best: WINNER = word 
+                if is_best:
+                    WINNER = word
                 fc = C_BAR_BEST if is_best else _lerp(C_BAR_BG, C_BAR_FG, 0.30)
                 if bh > 2:
                     _rr(screen, (bx, by, bw, bh), 4, fc)
 
-                _t(screen, f"{prob*100:.0f}%", font_sm,
+                _t(screen, f"{prob * 100:.0f}%", font_sm,
                    C_BAR_BEST if is_best else C_DIM,
-                   int(cx), by-2, anchor="midbottom")
+                   int(cx), by - 2, anchor="midbottom")
                 _t(screen, word,
                    font_md if n_cls <= 10 else font_sm,
                    C_WORD_ON if is_best else C_WORD_OFF,
-                   int(cx), BAR_TOP+MAX_H+7, anchor="midtop")
+                   int(cx), BAR_TOP + MAX_H + 7, anchor="midtop")
 
-        # Footer
-        pygame.draw.line(screen, C_BORDER, (0, WIN_H-32), (WIN_W, WIN_H-32), 1)
-        _t(screen, "SPACE  mute    +/-  VAD    C/V  confidence    H  bars    Q/ESC  quit",
-           font_sm, C_DIM, WIN_W//2, WIN_H-18)
+        pygame.draw.line(screen, C_BORDER, (0, WIN_H - 32), (WIN_W, WIN_H - 32), 1)
+        _t(screen,
+           "SPACE mute  |  +/- VAD  |  C/V conf  |  T/G temp  |  H bars  |  Q/ESC quit",
+           font_sm, C_DIM, WIN_W // 2, WIN_H - 18)
 
         pygame.display.flip()
 
     stop_evt.set()
     if _SD_AVAILABLE:
-        stream.stop(); stream.close()
+        stream.stop()
+        stream.close()
     pygame.quit()
     print("[EXIT] done.")
 
 
+# ─── Entry point ──────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--model",      "-m",   default="./numbers_training/model_best.pt")
-    ap.add_argument("--word_set",   "-ws",  default=None)
-    ap.add_argument("--conf",       "-c",   type=float, default=CONF_DEFAULT,
-                    help=f"Min confidence to count a prediction (default {CONF_DEFAULT})")
-    ap.add_argument("--preemph",    "-pe",  type=float, default=None,
-                    help="Pre-emphasis coefficient (overrides checkpoint/metadata.json). "
-                         "0 = disabled. Default: auto-detected.")
-    ap.add_argument("--target_rms", "-rms", type=float, default=None,
-                    help="RMS normalisation target (overrides checkpoint/metadata.json). "
-                         "0 = disabled. Default: auto-detected.")
+    ap = argparse.ArgumentParser(description="Real-time word recognition")
+    ap.add_argument("--model",       "-m",    default="./numbers_training/model_best.pt")
+    ap.add_argument("--word_set",    "-ws",   default=None)
+    ap.add_argument("--conf",        "-c",    type=float, default=CONF_DEFAULT,
+                    help=f"Min confidence to accept a prediction (default {CONF_DEFAULT})")
+    ap.add_argument("--temperature", "-temp", type=float, default=TEMPERATURE_DEF,
+                    help=f"Softmax temperature >1 spreads probs (default {TEMPERATURE_DEF})")
+    ap.add_argument("--preemph",     "-pe",   type=float, default=None,
+                    help="Pre-emphasis coefficient (overrides checkpoint). 0 = disabled.")
+    ap.add_argument("--target_rms",  "-rms",  type=float, default=None,
+                    help="RMS normalisation target (overrides checkpoint). 0 = disabled.")
+    ap.add_argument("--loopback",             action="store_true",
+                    help="Capture system audio (loopback) instead of microphone")
+    ap.add_argument("--device",      "-d",    type=str, default=None,
+                    help="Explicit sounddevice device name or integer index.")
     args = ap.parse_args()
+
     if not os.path.isfile(args.model):
-        print(f"[ERROR] {args.model} not found"); sys.exit(1)
-    run(args.model, args.word_set, args.conf, args.preemph, args.target_rms)
+        print(f"[ERROR] Model file not found: {args.model}")
+        sys.exit(1)
+
+    run(
+        model_path      = args.model,
+        word_set_path   = args.word_set,
+        use_loopback    = args.loopback,
+        audio_device    = args.device,
+        conf_threshold  = args.conf,
+        temperature     = args.temperature,
+        _cli_preemph    = args.preemph,
+        _cli_target_rms = args.target_rms,
+    )

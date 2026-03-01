@@ -60,6 +60,58 @@ class CNNClassifier(nn.Module):
             x = x[:,0:1,...]
         return self.head(self.pool(self.conv(x)))
 
+class CNNSEClassifier(nn.Module):
+    def __init__(self, n_classes: int, 
+                 average_frames: bool = False,use_deltas=True,
+                 *args, **kwargs):
+        super().__init__()
+        self.average_frames = average_frames
+        self.use_deltas = use_deltas
+        k_channels = 3 if use_deltas else 1
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(k_channels, 32, kernel_size=(3,3), padding=1),
+            nn.BatchNorm2d(32), 
+            nn.ReLU(),
+            nn.Conv2d(32, 32, kernel_size=(3,3), padding=1),
+            nn.BatchNorm2d(32), 
+            nn.ReLU(),
+            nn.MaxPool2d((2,2)), 
+            nn.Dropout2d(0.25),
+            SEBlock(32),
+
+            nn.Conv2d(32, 64, kernel_size=(3,3), padding=1),
+            nn.BatchNorm2d(64), 
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=(3,3), padding=1),
+            nn.BatchNorm2d(64), 
+            nn.ReLU(),
+            nn.MaxPool2d((2,2)), 
+            nn.Dropout2d(0.25),
+            SEBlock(64),
+
+            nn.Conv2d(64, 128, kernel_size=(3,3), padding=1),
+            nn.BatchNorm2d(128), 
+            nn.ReLU(),
+            nn.MaxPool2d((2,2)), 
+            nn.Dropout2d(0.25),
+            SEBlock(128),
+        )
+        self.pool = nn.AdaptiveAvgPool2d((4, 4))
+        self.head = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128 * 4 * 4, 512), nn.ReLU(), 
+            nn.Linear(512, 256), nn.ReLU(), 
+            nn.Dropout(0.50),
+            nn.Linear(256, n_classes),
+        )
+
+    def forward(self, x):
+        if self.average_frames:
+            x = x.mean(dim=2,keepdim=True) 
+        if not self.use_deltas:
+            x = x[:,0:1,...]
+        return self.head(self.pool(self.conv(x)))
 
 class DenseClassifier(nn.Module):
     def __init__(self, n_classes: int, n_frames: int, n_mels: int = 16,
@@ -248,6 +300,7 @@ class CNNTransformer(nn.Module):
 
 AVAILABLE_MODELS = {
     "CNN"         : CNNClassifier,
+    "CNNSE"       : CNNSEClassifier,
     "Dense"       : DenseClassifier,
     "CRNN"        : CRNNClassifier,
     "LSTM"        : LSTMClassifier,

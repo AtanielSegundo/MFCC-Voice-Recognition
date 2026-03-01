@@ -38,11 +38,21 @@ LR          = 1e-4
 WEIGHT_DECAY= 1e-4
 SEED        = 42
 
-MODEL          = next(iter(AVAILABLE_MODELS.keys()))
-AVERAGE_FRAMES = False 
-USE_DELTAS     = True
+MODEL           = next(iter(AVAILABLE_MODELS.keys()))
+AVERAGE_FRAMES  = False 
+USE_DELTAS      = True
+USE_SOFT_LABELS = False
 
-def run_epoch(model, loader, criterion, optimizer, device, training: bool):
+def soft_cross_entropy(logits, soft_targets):
+    """
+    Cross-entropy that accepts soft (float) label vectors.
+    logits:       [B, n_classes]  raw model output
+    soft_targets: [B, n_classes]  probability vectors (sum to 1)
+    """
+    log_probs = torch.nn.functional.log_softmax(logits, dim=1)
+    return -(soft_targets * log_probs).sum(dim=1).mean()
+
+def run_epoch(model, loader, class_weights, optimizer, device, training: bool, **kwargs):
     model.train(training)
     total_loss = 0.0
     all_preds, all_labels = [], []
@@ -51,7 +61,7 @@ def run_epoch(model, loader, criterion, optimizer, device, training: bool):
             features = features.to(device)
             labels   = labels.to(device)
             logits   = model(features)
-            loss     = criterion(logits, labels)
+            loss     = nn.functional.cross_entropy(logits, labels, weight=class_weights)
             if training:
                 optimizer.zero_grad()
                 loss.backward()
@@ -65,6 +75,51 @@ def run_epoch(model, loader, criterion, optimizer, device, training: bool):
     f1       = f1_score(all_labels, all_preds, average="macro", zero_division=0)
     return avg_loss, accuracy, f1, all_preds, all_labels
 
+def run_epoch_soft(model, loader, class_weights, optimizer, device, training: bool,
+                   mixup_alpha: float = 0.4, **kwargs):
+    model.train(training)
+    total_loss = 0.0
+    all_preds, all_labels = [], []
+    n_classes = len(class_weights)
+
+    with torch.set_grad_enabled(training):
+        for features, labels in loader:
+            features = features.to(device)
+            labels   = labels.to(device)
+
+            if training and mixup_alpha > 0:
+                lam = float(np.random.beta(mixup_alpha, mixup_alpha))
+                idx = torch.randperm(features.size(0), device=device)
+                mixed_features = lam * features + (1 - lam) * features[idx]
+                soft_a = torch.zeros(len(labels), n_classes, device=device)
+                soft_b = torch.zeros(len(labels), n_classes, device=device)
+                soft_a.scatter_(1, labels.unsqueeze(1), 1.0)
+                soft_b.scatter_(1, labels[idx].unsqueeze(1), 1.0)
+                soft_targets = lam * soft_a + (1 - lam) * soft_b
+                soft_targets = soft_targets * class_weights.unsqueeze(0)
+                soft_targets = soft_targets / soft_targets.sum(dim=1, keepdim=True)
+                logits = model(mixed_features)
+                loss   = soft_cross_entropy(logits, soft_targets)
+
+            else:
+                logits = model(features)
+                loss   = nn.functional.cross_entropy(
+                            logits, labels, weight=class_weights)
+
+            if training:
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+                optimizer.step()
+
+            total_loss += loss.item() * len(labels)
+            all_preds.extend(logits.argmax(1).cpu().tolist())
+            all_labels.extend(labels.cpu().tolist())
+
+    avg_loss = total_loss / len(loader.dataset)
+    accuracy = sum(p == l for p, l in zip(all_preds, all_labels)) / len(all_labels)
+    f1       = f1_score(all_labels, all_preds, average="macro", zero_division=0)
+    return avg_loss, accuracy, f1, all_preds, all_labels
 
 def save_report(history, labels, preds, words, out_dir,
                 train_size, val_size, elapsed_s,
@@ -161,8 +216,7 @@ def main(dataset_path: str, word_set_path=None):
     print(f"\n[MODEL] Parameters: {n_params:,}")
     print(model)
 
-    weights   = full_ds.class_weights().to(device)
-    criterion = nn.CrossEntropyLoss(weight=weights)
+    weights = full_ds.class_weights().to(device)
     optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-5)
 
@@ -174,11 +228,17 @@ def main(dataset_path: str, word_set_path=None):
     print(f"\n[TRAIN] Starting {EPOCHS} epochs ...\n")
     t0 = time.perf_counter()
 
+    run_epoch_fn = run_epoch_soft if USE_SOFT_LABELS else run_epoch
+
     for epoch in range(1, EPOCHS + 1):
-        tr_loss, tr_acc, tr_f1, _, _ = run_epoch(
-            model, train_loader, criterion, optimizer, device, training=True)
-        vl_loss, vl_acc, vl_f1, val_preds, val_labels = run_epoch(
-            model, val_loader, criterion, optimizer, device, training=False)
+        tr_loss, tr_acc, tr_f1, _, _ = run_epoch_fn(
+            model, train_loader, weights, optimizer, device, training=True,
+            mixup_alpha=0.2
+            )
+        vl_loss, vl_acc, vl_f1, val_preds, val_labels = run_epoch_fn(
+            model, val_loader, weights, optimizer, device, training=False,
+            mixup_alpha=0.0
+            )
         scheduler.step()
 
         history["train_loss"].append(tr_loss)
@@ -282,6 +342,7 @@ if __name__ == "__main__":
                         )
     parser.add_argument("--average_frames", "-avg", default=AVERAGE_FRAMES, action="store_true")
     parser.add_argument("--no_deltas", "-deltas", default=USE_DELTAS, action="store_false")
+    parser.add_argument("--use_soft_labels", "-soft", default=USE_SOFT_LABELS, action="store_true")
     args = parser.parse_args()
 
     EPOCHS     = args.epochs
@@ -297,5 +358,6 @@ if __name__ == "__main__":
     MODEL      = args.model
     AVERAGE_FRAMES = args.average_frames
     USE_DELTAS = args.no_deltas
+    USE_SOFT_LABELS = args.use_soft_labels
 
     main(dataset_path=args.dataset, word_set_path=args.word_set)

@@ -533,6 +533,7 @@ def cut_and_window(
     sample_rate     : float,
     preemph_coef    : float = 0.97,
     target_rms      : float = _DEFAULT_TARGET_RMS,
+    zero_pad        : bool  = False,
 ) -> None:
     """
     For every .wav in *out* that has a matching .TextGrid, runs the full
@@ -540,7 +541,9 @@ def cut_and_window(
 
     Processing order (order matters):
         1. Resample to *sample_rate*          (if needed)
-        2. Cut centred window                 [centre - duration/2, centre + duration/2]
+        2. Cut window
+             normal  : centred on the word midpoint  [centre - duration/2, centre + duration/2]
+             zero_pad: exactly the aligned word interval, zero-padded to *duration* on both sides
         3. Pre-emphasis                       y[n] = x[n] - preemph_coef * x[n-1]
         4. Tukey window                       cosine fade-in / flat / cosine fade-out
         5. RMS normalisation                  scale to *target_rms* RMS amplitude
@@ -550,6 +553,10 @@ def cut_and_window(
         target_rms   : Desired RMS amplitude after normalisation.
                        Default is −23 dBFS (≈ 0.071), the EBU R128 anchor.
                        Pass 0.0 to disable normalisation.
+        zero_pad     : If True, extract exactly the aligned word interval and
+                       zero-pad symmetrically on both sides to reach *duration*.
+                       If False (default), extract a window of *duration* centred
+                       on the word midpoint.
     """
     final_dir = os.path.join(out, "final")
     os.makedirs(final_dir, exist_ok=True)
@@ -609,23 +616,63 @@ def cut_and_window(
             sr = orig_sr
 
         total_samples = len(samples)
-        word_centre   = (target_interval["xmin"] + target_interval["xmax"]) / 2.0
-        half_dur      = duration / 2.0
-        start_sec     = word_centre - half_dur
-        end_sec       = word_centre + half_dur
+        win_len       = int(round(duration * sr))
+        segment       = np.zeros(win_len, dtype=np.float64)
 
-        start_idx = int(round(start_sec * sr))
-        end_idx   = int(round(end_sec   * sr))
-        win_len   = end_idx - start_idx
+        if zero_pad:
+            # ── Zero-pad mode ─────────────────────────────────────────────────
+            # Extract exactly the aligned word and centre it inside a
+            # zero-initialised window of length win_len.
+            word_start_idx = int(round(target_interval["xmin"] * sr))
+            word_end_idx   = int(round(target_interval["xmax"] * sr))
+            word_len       = word_end_idx - word_start_idx
 
-        segment   = np.zeros(win_len, dtype=np.float64)
-        src_start = max(start_idx, 0)
-        src_end   = min(end_idx, total_samples)
-        dst_start = src_start - start_idx
-        dst_end   = dst_start + (src_end - src_start)
+            if word_len >= win_len:
+                # Word is longer than (or equal to) the target window:
+                # crop to win_len centred on the word midpoint.
+                mid      = (word_start_idx + word_end_idx) // 2
+                src_start = max(mid - win_len // 2, 0)
+                src_end   = src_start + win_len
+                src_end   = min(src_end, total_samples)
+                copy_len  = src_end - src_start
+                segment[:copy_len] = samples[src_start:src_end]
+                log.INFO(
+                    f"[CUT] {wav_name}  zero_pad: word ({word_len} samples) >= "
+                    f"win ({win_len}), centred crop applied."
+                )
+            else:
+                # Place the word centred inside the zero buffer
+                pad_left  = (win_len - word_len) // 2
+                dst_start = pad_left
+                dst_end   = pad_left + word_len
+                src_start = max(word_start_idx, 0)
+                src_end   = min(word_end_idx,   total_samples)
+                # Adjust dst offsets if the word sits near the file edge
+                dst_start += max(0, -word_start_idx)
+                actual_len = src_end - src_start
+                segment[dst_start: dst_start + actual_len] = samples[src_start:src_end]
 
-        if src_end > src_start:
-            segment[dst_start:dst_end] = samples[src_start:src_end]
+            mode_tag = "zero_pad"
+        else:
+            # ── Centred window mode (original behaviour) ──────────────────────
+            word_centre = (target_interval["xmin"] + target_interval["xmax"]) / 2.0
+            half_dur    = duration / 2.0
+            start_sec   = word_centre - half_dur
+            end_sec     = word_centre + half_dur
+
+            start_idx = int(round(start_sec * sr))
+            end_idx   = int(round(end_sec   * sr))
+            win_len   = end_idx - start_idx          # recompute in case of rounding
+            segment   = np.zeros(win_len, dtype=np.float64)
+
+            src_start = max(start_idx, 0)
+            src_end   = min(end_idx, total_samples)
+            dst_start = src_start - start_idx
+            dst_end   = dst_start + (src_end - src_start)
+            if src_end > src_start:
+                segment[dst_start:dst_end] = samples[src_start:src_end]
+
+            mode_tag = "centred"
 
         rms_before = float(np.sqrt(np.mean(segment ** 2)))
 
@@ -656,7 +703,7 @@ def cut_and_window(
         log.INFO(
             f"[CUT] {wav_name}  word='{target_interval['text']}'  "
             f"[{target_interval['xmin']:.3f}→{target_interval['xmax']:.3f}]  "
-            f"centre={word_centre:.3f}s  "
+            f"mode={mode_tag}  "
             f"rms {rms_before:.4f}→{rms_after:.4f}  "
             f"gain×{norm_scale:.2f}  "
             f"→ final/{wav_name}"
@@ -812,6 +859,13 @@ if __name__ == "__main__":
                         help="Window duration in seconds centred on the target word (default: 1.0)")
     parser.add_argument("--emphasis", "-e", type=float, default=0.5,
                         help="Flat (emphasis) fraction of the Tukey window, 0..1 (default: 0.5)")
+    parser.add_argument("--zero_pad", "-zpad", action="store_true",
+                        help=(
+                            "Cut mode: extract exactly the aligned word interval and "
+                            "zero-pad symmetrically on both sides to reach --duration. "
+                            "Default (off): extract a window of --duration centred on "
+                            "the word midpoint."
+                        ))
     parser.add_argument("--preemph", "-pe", type=float, default=0.97,
                         help=(
                             "Pre-emphasis filter coefficient (0 = disabled, "
@@ -856,6 +910,7 @@ if __name__ == "__main__":
     PREEMPH_COEF     = args.preemph
     TARGET_RMS       = args.target_rms
     SEED             = args.seed
+    ZERO_PAD         = args.zero_pad
 
     # --clean requires step 4 to have run
     if args.clean and args.skip_cut:
@@ -888,6 +943,7 @@ if __name__ == "__main__":
              if TARGET_RMS > 0 else "Target RMS       : disabled")
     log.INFO(f"Traversal seed   : {SEED}")
     log.INFO(f"Clean mode       : {args.clean}")
+    log.INFO(f"Zero-pad mode    : {ZERO_PAD}")
     log.INFO(f"Word set         : {WORD_SET}")
 
     # ── Step 1 ────────────────────────────────────────────────────────────────
@@ -912,7 +968,7 @@ if __name__ == "__main__":
         log.NEWLINE(1)
         log.INFO("[STEP 4] Cutting and windowing audio …")
         cut_and_window(out_folder, WORD_SET, DURATION, EMPHASIS_PERCENT,
-                       sample_rate, PREEMPH_COEF, TARGET_RMS)
+                       sample_rate, PREEMPH_COEF, TARGET_RMS, ZERO_PAD)
     else:
         log.INFO("[STEP 4] Cut+window skipped (--skip_cut).")
 
@@ -931,4 +987,5 @@ if __name__ == "__main__":
         "preemph":     PREEMPH_COEF,
         "target_rms":  TARGET_RMS,
         "seed":        SEED,
+        "zero_pad":    ZERO_PAD,
     })
